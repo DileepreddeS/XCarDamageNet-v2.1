@@ -1,0 +1,42 @@
+# Architecture code is public. Internal specs, cluster scripts, trained
+# weights, results and design records stay private.
+
+# internal specification / build documents
+CLAUDE.md
+BUILD_GUIDE.md
+docs/
+
+slurm/
+weights/
+checkpoints/
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# results: experiment history and raw run dumps stay private
+results/runs.csv
+results/*.json
+results/runs/
+runs/
+
+# data
+datasets/
+*.tar
+*.zip
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# tooling
+.vscode/
+.idea/
+.DS_Store
+*.log
+wandb/
