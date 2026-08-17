@@ -1,0 +1,68 @@
+# Full run — all aux modules enabled at once, warm-started from Phase A.
+#
+# Schedule and augmentation are identical to phase_a.yaml; the only differences
+# are the three aux module flags and the checkpoint this initialises from.
+
+phase: full
+description: attention + physics + fraud + contrastive, all enabled
+
+model: /home/ds3424/XCarDamageNet-v2.1/models/phase_a_best.pt
+data: /scratch/ds3424/cardd/yolo/cardd.yaml
+project: /scratch/ds3424/cardd
+name: cardd_v21_full
+
+# --- schedule -------------------------------------------------------------
+imgsz: 1024
+batch: 8
+epochs: 200
+patience: 50
+cos_lr: true
+save_period: 10
+amp: false                 # fp16 produced NaN losses on this setup
+workers: 8
+
+# --- optimiser ------------------------------------------------------------
+lr0: 0.01
+lrf: 0.01
+warmup_epochs: 3.0
+momentum: 0.937
+weight_decay: 0.0005
+
+# --- loss gains -----------------------------------------------------------
+box: 7.5
+cls: 0.5
+dfl: 1.5
+
+# --- augmentation ---------------------------------------------------------
+mosaic: 1.0
+mixup: 0.10
+copy_paste: 0.30
+close_mosaic: 20
+fliplr: 0.5
+flipud: 0.0
+degrees: 0.0
+translate: 0.1
+scale: 0.5
+hsv_h: 0.015
+hsv_s: 0.7
+hsv_v: 0.4
+
+# --- aux modules ----------------------------------------------------------
+use_attention: true        # AttentionMapHead        -> L_attn     (0.10)
+use_physics: true          # adapter + physics + fraud -> L_physics (0.02), L_fraud (0.01)
+use_contrastive: true      # ContrastiveDamageModule -> L_contrast (0.05)
+
+# Token attach point for physics/contrastive. The attention head is always on
+# P3 regardless. Change these ONLY as the documented OOM fallback, and never
+# silently — both values are printed at startup and belong in results/runs.csv.
+#   attach: p3, token_stride: 1  -> 16,384 tokens (default)
+#   attach: p3, token_stride: 2  ->  4,096 tokens (first fallback)
+#   attach: p4, token_stride: 1  ->  4,096 tokens (second fallback)
+attach: p3
+token_stride: 1
+suspicious_thresh: 0.5
+
+# --- backup ---------------------------------------------------------------
+# best.pt is copied here every `backup_every` epochs; scratch is volatile.
+backup_dir: /home/ds3424/XCarDamageNet-v2.1/models
+backup_every: 10
