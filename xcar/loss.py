@@ -147,22 +147,33 @@ class XCarLoss(v8DetectionLoss):
         anchors, i.e. the most confident detection of each class in the image.
         `parsed["scores"]` is (B, nc, num_anchors) pre-sigmoid.
 
-        This term updates both heads, which makes mutual collapse possible: the
-        loss is linear in the physics distribution, so gradient descent pushes
-        it onto a one-hot at the detector's argmax while the detector is pulled
-        the other way. Two diagnostics are recorded every call:
+        The detector logits are DETACHED, so this term is one-directional: the
+        physics head learns to predict what the detector already says, and the
+        detector is never pulled toward the physics head. Two reasons:
+
+          * The aux path is meant to be gradient-isolated from the detection
+            path. Detaching P3 before the aux modules is not sufficient on its
+            own -- this term reads detector output directly, which is a second
+            route into the backbone. `scripts/smoke_test.py` PART 3 fails if
+            either route is open.
+          * It removes the mutual-collapse failure mode. The loss is linear in
+            the physics distribution, so with a live target both sides could
+            walk onto one arbitrary class and drive the term to ~0 while
+            carrying no information.
+
+        Collapse is still possible one-sidedly (the physics head saturating on a
+        single class), so the diagnostics stay:
 
             phys_entropy  ln(6)=1.792 at uniform -> 0.0 on collapse
             phys_agree    fraction with argmax(physics)==argmax(detector)
-                          -> 1.00 on collapse
 
-        Entropy decaying toward 0 with agreement pinned at 1.00 and phys_loss
-        near 0 is the collapse signature.
+        Entropy near 0 with agreement pinned at 1.00 and phys_loss near 0 is the
+        collapse signature; the detector's own mAP is now unaffected either way.
         """
         implied = aux.get("fraud_implied")
         if implied is None:
             raise RuntimeError("use_physics is set but _aux has no 'fraud_implied'.")
-        pred_class_logits = parsed["scores"].amax(dim=2)  # (B, nc)
+        pred_class_logits = parsed["scores"].detach().amax(dim=2)  # (B, nc), no grad to detector
 
         with torch.no_grad():
             probs = implied.detach().softmax(dim=-1)

@@ -234,17 +234,26 @@ class XCarDetectionModel(DetectionModel):
 
         aux: dict[str, Any] = {}
 
+        # Aux modules see a DETACHED view of the neck features, so their
+        # gradients stop at the aux module boundary and never reach the
+        # backbone or neck. The detection path is untouched: Detect consumes
+        # the original tensor straight from the layer output, and our forward
+        # hooks only observe it. So P3 still gets full detection gradient --
+        # what it no longer gets is L_attn / L_physics / L_contrast pulling the
+        # shared representation around while the detector is trying to learn.
+        p3_for_aux = p3.detach()
+
         # --- attention maps (always P3, full resolution) -----------------
         attn_maps = None
         if self.use_attention:
-            attn_maps = self.aux["attn_head"](p3)  # (B, 6, H3, W3)
+            attn_maps = self.aux["attn_head"](p3_for_aux)  # (B, 6, H3, W3)
             aux["attn_maps"] = attn_maps
 
         if not self.use_physics:
             return aux
 
         # --- token source ------------------------------------------------
-        src = p3 if self.attach == "p3" else self._feats["p4"]
+        src = p3_for_aux if self.attach == "p3" else self._feats["p4"].detach()
         if self.token_stride > 1:
             src = src[:, :, :: self.token_stride, :: self.token_stride]  # non-contiguous
         _, _, th, tw = src.shape

@@ -33,6 +33,7 @@ sys.path.insert(0, str(REPO))
 import ultralytics  # noqa: E402
 from ultralytics import YOLO  # noqa: E402
 
+from xcar.cb_loss import CARDD_CLASS_COUNTS, CB_BETA, compute_cb_weights, format_weights  # noqa: E402
 from xcar.loss import W_ATTN, W_CONTRAST, W_FRAUD, W_PHYSICS  # noqa: E402
 from xcar.trainer import XCarTrainer  # noqa: E402
 
@@ -44,6 +45,7 @@ NON_TRAIN_KEYS = {
     "phase", "description", "model",
     "use_attention", "use_physics", "use_contrastive",
     "attach", "token_stride", "suspicious_thresh",
+    "use_cb_loss", "cb_beta",
     "backup_dir", "backup_every",
 }
 
@@ -254,6 +256,8 @@ def main() -> int:
         "suspicious_thresh": cfg["suspicious_thresh"],
     }
     XCarTrainer.xcar_cfg = aux_cfg
+    XCarTrainer.use_cb_loss = bool(cfg.get("use_cb_loss", True))
+    XCarTrainer.cb_beta = float(cfg.get("cb_beta", CB_BETA))
 
     train_kwargs = {k: v for k, v in cfg.items() if k not in NON_TRAIN_KEYS}
     if args.data:
@@ -266,6 +270,16 @@ def main() -> int:
     print(f"aux modules : {aux_cfg}")
     print(f"loss weights: attn={W_ATTN}  contrast={W_CONTRAST}  "
           f"physics={W_PHYSICS}  fraud={W_FRAUD}")
+    print("aux grads   : DETACHED at the neck — aux losses train the aux "
+          "modules only, never the backbone/neck")
+    if XCarTrainer.use_cb_loss:
+        preview = compute_cb_weights(CARDD_CLASS_COUNTS.values(), beta=XCarTrainer.cb_beta)
+        print(f"cb loss     : ON  beta={XCarTrainer.cb_beta}  "
+              f"expected weights -> {format_weights(preview, CARDD_CLASS_COUNTS)}")
+        print("              (the trainer prints [CB LOSS] proof read off the live "
+              "criterion at batch 1)")
+    else:
+        print("cb loss     : OFF")
     print("\ntrain kwargs:")
     for k in sorted(train_kwargs):
         print(f"  {k:<16} {train_kwargs[k]}")

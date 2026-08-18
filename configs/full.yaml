@@ -33,6 +33,27 @@ box: 7.5
 cls: 0.5
 dfl: 1.5
 
+# --- class-balanced cls loss (Cui et al., CVPR 2019) ----------------------
+# Re-weights the classification BCE by 1 / effective-number-of-samples, using
+# the CarDD train-split counts in CLAUDE.md 0.5. Weights are normalised to sum
+# to nc, so mean weight is 1.0 and the cls-loss magnitude is comparable to an
+# unweighted run.
+#
+#   dent=0.3197  scratch=0.2339  crack=0.8380
+#   glass_shatter=1.1386  lamp_broken=1.0958  tire_flat=2.3740
+#
+# Attaches via ultralytics' native `model.class_weights` hook, which
+# v8DetectionLoss multiplies into bce_loss (ultralytics/utils/loss.py:433).
+# An on_train_batch_start callback prints the values read back OFF the live
+# criterion object; v1's version printed "applied" without ever attaching.
+use_cb_loss: true
+cb_beta: 0.9999
+
+# NOTE: ultralytics' own cls_pw inverse-frequency weighting writes to the same
+# attribute. It defaults to 0.0 (disabled) and must stay there — setting both
+# would mean whichever ran last silently wins.
+cls_pw: 0.0
+
 # --- augmentation ---------------------------------------------------------
 mosaic: 1.0
 mixup: 0.10

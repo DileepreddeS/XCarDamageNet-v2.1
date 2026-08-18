@@ -9,12 +9,18 @@
   5. Asserts every loss term is finite and non-zero where it should be.
   6. Exits non-zero on any failure.
 
-Plus two structural checks:
+Plus four structural checks:
   * The adapter's `in_ch` is asserted equal to the P3 channel count read from
     the built model, so a hardcoded value cannot creep in.
   * A per-module gradient audit runs for each configuration and asserts that
     every active aux module receives gradient. A module that trains on no
     gradient is the same class of silent failure as a loss term stuck at 0.0.
+  * An aux-gradient isolation audit: backward through the aux terms alone must
+    reach no backbone/neck parameter (the neck features are detached before
+    the aux modules), while the full loss still must.
+  * A class-balanced-loss check: the CB weights are correct, and attaching them
+    demonstrably changes the real cls_loss. v1 logged "applied" for a CB
+    callback that never attached anything, so arithmetic alone is not proof.
 
 Run:  python scripts/smoke_test.py
 """
@@ -33,6 +39,14 @@ sys.path.insert(0, str(REPO))
 import ultralytics  # noqa: E402
 from ultralytics.cfg import get_cfg  # noqa: E402
 
+from xcar.cb_loss import (  # noqa: E402
+    CARDD_CLASS_COUNTS,
+    CB_BETA,
+    bce_multiply_site,
+    cardd_cb_weights,
+    format_weights,
+    make_cb_loss_callback,
+)
 from xcar.loss import W_ATTN, W_CONTRAST, W_FRAUD, W_PHYSICS  # noqa: E402
 from xcar.model import PHYSICS_DIM, TOKEN_DIM, XCarDetectionModel, get_neck_channels  # noqa: E402
 
@@ -325,6 +339,194 @@ def run_grad_audit() -> None:
 
 
 # --------------------------------------------------------------------------
+# aux-gradient isolation — the check that the neck detach actually holds
+# --------------------------------------------------------------------------
+SMALL = 256  # reduced imgsz; gradient topology is size-independent
+
+
+def run_detach_audit() -> None:
+    """Assert the aux losses cannot move the backbone or neck.
+
+    The aux modules read a `.detach()`ed view of the neck features, so:
+      * backward through ONLY the aux terms must leave every parameter under
+        `model.model` (backbone + neck + Detect) with no gradient, and
+      * backward through the full loss must still reach them, via the
+        detection path, which the detach does not touch.
+
+    Both halves matter. The first alone would also pass if the aux modules were
+    disconnected entirely; the second alone would pass without any detach.
+    """
+    print("\n" + "=" * 74)
+    print("PART 3 — AUX GRADIENT ISOLATION (detached neck features)")
+    print("=" * 74)
+
+    torch.manual_seed(0)
+    model = build_model(use_attention=True, use_physics=True, use_contrastive=True)
+    model.train()
+
+    batch = make_batch(seed=4)
+    batch["img"] = torch.rand(BATCH, 3, SMALL, SMALL)
+
+    # ---- (a) aux terms only -> detector must receive nothing ----------
+    model.zero_grad(set_to_none=True)
+    loss, _ = model(batch)
+    n_yolo_terms = 3  # box, cls, dfl
+    aux_only = loss[n_yolo_terms:].sum()
+    check(
+        float(aux_only.detach()) != 0.0,
+        f"aux-only loss is non-zero ({float(aux_only.detach()):.6f}) — a zero here "
+        "would make the isolation check vacuous",
+    )
+    aux_only.backward()
+
+    detector_hits = [
+        n for n, p in model.model.named_parameters()
+        if p.grad is not None and float(p.grad.abs().sum()) > 0
+    ]
+    aux_hits = [
+        n for n, p in model.aux.named_parameters()
+        if p.grad is not None and float(p.grad.abs().sum()) > 0
+    ]
+    print(f"\n  backward(aux terms only):")
+    print(f"    detector params (model.model) with non-zero grad : {len(detector_hits)}")
+    print(f"    aux params      (model.aux)   with non-zero grad : {len(aux_hits)}")
+    if detector_hits:
+        print(f"    LEAKED INTO: {detector_hits[:8]}{' ...' if len(detector_hits) > 8 else ''}")
+
+    check(
+        not detector_hits,
+        "aux losses reach NO backbone/neck/Detect parameter (the neck detach holds)",
+    )
+    check(
+        len(aux_hits) > 0,
+        f"aux losses do reach the aux modules ({len(aux_hits)} tensors) — they still train",
+    )
+
+    # ---- (b) full loss -> detector must still receive gradient --------
+    model.zero_grad(set_to_none=True)
+    loss, _ = model(batch)
+    loss.sum().backward()
+    detector_hits_full = sum(
+        1 for _, p in model.model.named_parameters()
+        if p.grad is not None and float(p.grad.abs().sum()) > 0
+    )
+    print(f"\n  backward(full loss):")
+    print(f"    detector params with non-zero grad : {detector_hits_full}")
+    check(
+        detector_hits_full > 0,
+        f"the detection loss still trains the backbone/neck ({detector_hits_full} "
+        "tensors) — the detach did not sever the detector",
+    )
+
+
+# --------------------------------------------------------------------------
+# class-balanced loss — weights are correct AND actually change the cls term
+# --------------------------------------------------------------------------
+def run_cb_loss_check() -> None:
+    """Assert the CB weights are right and that they move the real cls loss.
+
+    v1's CB attempt logged success without ever attaching anything, so a check
+    that only inspects our own arithmetic is not enough. This runs the actual
+    criterion twice on one batch — weights off, then on — and requires the
+    logged cls_loss to change.
+    """
+    print("\n" + "=" * 74)
+    print("PART 4 — CLASS-BALANCED LOSS (weights + proof they reach cls_loss)")
+    print("=" * 74)
+
+    weights = cardd_cb_weights(beta=CB_BETA)
+    nc = len(CARDD_CLASS_COUNTS)
+    counts = list(CARDD_CLASS_COUNTS.values())
+    print(f"\n  beta = {CB_BETA}")
+    print(f"  counts  : {CARDD_CLASS_COUNTS}")
+    print(f"  weights : {format_weights(weights, CARDD_CLASS_COUNTS)}")
+
+    print("\n  weight assertions:")
+    check(tuple(weights.shape) == (nc,), f"weights shape {tuple(weights.shape)} == ({nc},)")
+    check(
+        abs(float(weights.sum()) - nc) < 1e-4,
+        f"weights sum to nc ({float(weights.sum()):.6f} == {nc})",
+    )
+    check(torch.isfinite(weights).all().item(), "weights are all finite")
+    check(bool((weights > 0).all()), "weights are all positive")
+    # Rarer class => larger weight. Checked as a strict ordering against counts
+    # rather than a spot value, so a sign flip in the formula cannot slip by.
+    order_counts = sorted(range(nc), key=lambda i: counts[i])
+    ordered_w = [float(weights[i]) for i in order_counts]
+    check(
+        all(ordered_w[i] > ordered_w[i + 1] for i in range(nc - 1)),
+        "weight is strictly decreasing in class count (rarest class weighted highest)",
+    )
+    check(
+        int(weights.argmax()) == counts.index(min(counts)),
+        f"heaviest weight is on the rarest class (tire_flat, n={min(counts)})",
+    )
+    check(
+        bce_multiply_site() is not None,
+        "ultralytics' cls loss still multiplies bce_loss by self.class_weights",
+    )
+
+    # ---- functional: same model, same batch, weights off then on ------
+    torch.manual_seed(0)
+    model = build_model()  # stock detection path; CB touches only the cls term
+    model.train()
+    batch = make_batch(seed=5)
+    batch["img"] = torch.rand(BATCH, 3, SMALL, SMALL)
+
+    _, items_off = model(batch)
+    cls_off = float(items_off[1])
+
+    # Drive the real callback against a stand-in trainer, exactly as ultralytics
+    # would at on_train_batch_start.
+    class _FakeTrainer:
+        def __init__(self, m):
+            self.model = m
+
+    trainer = _FakeTrainer(model)
+    cb = make_cb_loss_callback(weights, list(CARDD_CLASS_COUNTS))
+    print("\n  invoking the on_train_batch_start callback:")
+    cb(trainer)
+
+    attached = getattr(model.criterion, "class_weights", None)
+    check(attached is not None, "callback attached class_weights to the live criterion")
+    if attached is not None:
+        check(
+            tuple(attached.shape) == (1, 1, nc),
+            f"attached shape {tuple(attached.shape)} == (1, 1, {nc}) — broadcasts "
+            "over bce_loss (bs, num_anchors, nc)",
+        )
+        check(
+            torch.allclose(attached.flatten().cpu(), weights.cpu()),
+            "attached values equal the computed CB weights",
+        )
+
+    _, items_on = model(batch)
+    cls_on = float(items_on[1])
+    print(f"\n  cls_loss without CB weights : {cls_off:.6f}")
+    print(f"  cls_loss with    CB weights : {cls_on:.6f}")
+    print(f"  delta                       : {cls_on - cls_off:+.6f}")
+    check(
+        cls_off != cls_on,
+        "cls_loss CHANGED once the weights were attached — they are genuinely "
+        "consumed by the loss, not merely stored on an object",
+    )
+    check(
+        float(items_off[0]) == float(items_on[0]) and float(items_off[2]) == float(items_on[2]),
+        "box_loss and dfl_loss are unchanged — CB touches only the cls term",
+    )
+
+    # ---- the callback must be a no-op before the criterion exists -----
+    torch.manual_seed(0)
+    fresh = build_model()
+    cb2 = make_cb_loss_callback(weights, list(CARDD_CLASS_COUNTS))
+    cb2(_FakeTrainer(fresh))
+    check(
+        getattr(fresh, "criterion", None) is None,
+        "callback is a quiet no-op before the criterion is built (it retries next batch)",
+    )
+
+
+# --------------------------------------------------------------------------
 def main() -> int:
     print("=" * 74)
     print("XCarDamageNet — SMOKE TEST")
@@ -338,6 +540,8 @@ def main() -> int:
     try:
         run_full_gate()
         run_grad_audit()
+        run_detach_audit()
+        run_cb_loss_check()
     except Exception:
         traceback.print_exc()
         FAILURES.append(f"uncaught exception: see traceback above")
