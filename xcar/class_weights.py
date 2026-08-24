@@ -1,19 +1,32 @@
-"""Class-Balanced loss weights (Cui et al., CVPR 2019) for the detection cls term.
+"""Per-class weights for the detection cls term, and the machinery to prove
+they reached the live loss object.
 
-CarDD is 11.4x imbalanced (scratch 2560 vs tire_flat 225). CB re-weights the
-classification BCE by the inverse *effective number* of samples rather than the
-raw inverse frequency, which is gentler on the head classes:
+Two schemes live here. Exactly one may be active per run.
 
-    E_n = (1 - beta^n) / (1 - beta)        effective number of samples
-    w_c = 1 / E_n = (1 - beta) / (1 - beta^n)
+DIFFICULTY-AWARE (in use)
+-------------------------
+Weight by inverse Phase A per-class AP: classes the detector is already bad at
+get a larger share of the classification gradient.
 
-then normalised so the weights sum to `nc` (equivalently, mean 1.0), which keeps
-the overall cls-loss magnitude comparable to the unweighted run.
+    w_c = 1 / AP_c,  normalised so sum(w) == nc
 
-WHERE THIS ATTACHES
--------------------
-ultralytics 8.4.48 has a first-class hook for exactly this. `v8DetectionLoss`
-reads `model.class_weights` at criterion construction:
+CLASS-BALANCED (Cui et al., CVPR 2019 — measured, rejected)
+-----------------------------------------------------------
+Weight by inverse effective number of samples:
+
+    w_c = (1 - beta) / (1 - beta^n_c),  normalised so sum(w) == nc
+
+Kept in the tree because it is a measured ablation row, not dead code. It did
+not work on CarDD: frequency and difficulty are close to uncorrelated here, so
+CB spent its budget on classes that were already strong (tire_flat, n=225,
+weight 2.37, AP 0.898 -> 0.966) while down-weighting the single hardest class
+(crack, n=651, weight 0.84, AP 0.521 -> 0.399). Difficulty weighting is the
+direct fix: rank by what the detector actually gets wrong, not by how rare it is.
+
+WHERE BOTH ATTACH
+-----------------
+ultralytics 8.4.48 has a first-class hook. `v8DetectionLoss` reads
+`model.class_weights` at criterion construction:
 
     ultralytics/utils/loss.py:353   self.class_weights = getattr(model, "class_weights", None)
     ultralytics/utils/loss.py:355   self.class_weights = self.class_weights.to(device).view(1, 1, -1)
@@ -24,8 +37,8 @@ and consumes it inside the cls term:
     ultralytics/utils/loss.py:433   bce_loss *= self.class_weights
     ultralytics/utils/loss.py:434   loss[1] = bce_loss.sum() / target_scores_sum
 
-So there is no need to reach inside and swap a BCE object: the attribute is real
-and is read on every batch.
+So neither scheme needs to reach inside and swap a BCE object: the attribute is
+real and is read on every batch.
 
 WHY v1's ATTEMPT FAILED
 -----------------------
@@ -49,9 +62,37 @@ from ultralytics.utils import LOGGER
 from ultralytics.utils.loss import v8DetectionLoss
 from ultralytics.utils.torch_utils import unwrap_model
 
-#: CarDD training-split instance counts (CLAUDE.md 0.5). Authoritative for the
-#: published numbers; the trainer cross-checks these against the counts the
-#: dataloader actually reports and warns loudly on any mismatch.
+# --------------------------------------------------------------------------
+# difficulty-aware weighting
+# --------------------------------------------------------------------------
+#: Phase A per-class AP@0.5 on the CarDD TEST split (mAP@0.5 = 0.7468).
+#:
+#: METHODOLOGICAL CAVEAT — READ BEFORE PUBLISHING.
+#: These are TEST-split numbers, so weights derived from them carry test
+#: information into training. The resulting test mAP is therefore not a clean
+#: held-out estimate, and the paper cannot present it as one without saying so.
+#: The clean version is to refit this dict from Phase A's VALIDATION per-class
+#: AP and re-run; nothing else in the code changes, and the weights would move
+#: only slightly. Until then, treat this run's test number as development data.
+PHASE_A_TEST_AP50: dict[str, float] = {
+    "dent": 0.601,
+    "scratch": 0.615,
+    "crack": 0.521,
+    "glass_shatter": 0.984,
+    "lamp_broken": 0.862,
+    "tire_flat": 0.898,
+}
+
+#: Floor on AP before inverting, so a class the detector fails on completely
+#: cannot take over the whole cls gradient. At Phase A's APs (min 0.521) this
+#: never binds; it exists so a future refit on a weaker checkpoint degrades
+#: sanely instead of producing a 100x weight.
+MIN_AP = 0.05
+
+# --------------------------------------------------------------------------
+# class-balanced weighting (kept as a measured ablation)
+# --------------------------------------------------------------------------
+#: CarDD training-split instance counts (CLAUDE.md 0.5).
 CARDD_CLASS_COUNTS: dict[str, int] = {
     "dent": 1806,
     "scratch": 2560,
@@ -62,6 +103,34 @@ CARDD_CLASS_COUNTS: dict[str, int] = {
 }
 
 CB_BETA = 0.9999
+
+
+def _normalise(w: torch.Tensor) -> torch.Tensor:
+    """Scale so the weights sum to len(w), i.e. mean 1.0.
+
+    Keeps the cls-loss magnitude comparable to an unweighted run, so the
+    box/cls/dfl gains in the config keep their meaning.
+    """
+    return w * (len(w) / w.sum())
+
+
+def compute_difficulty_weights(
+    ap_by_class, beta: float | None = None, device=None, dtype=torch.float32
+) -> torch.Tensor:
+    """Inverse-AP weights, normalised to sum to len(ap_by_class).
+
+    Args:
+        ap_by_class: per-class AP, indexed by class id (an iterable of floats,
+            or a dict's .values() in class-id order).
+        beta: unused; accepted so both schemes share a call signature.
+
+    Returns:
+        (nc,) float tensor summing to nc. Hardest class gets the largest weight.
+    """
+    ap = torch.as_tensor(list(ap_by_class), dtype=torch.float64)
+    if bool((ap <= 0).any()) or bool((ap > 1).any()):
+        raise ValueError(f"AP values must be in (0, 1], got {ap.tolist()}")
+    return _normalise(1.0 / ap.clamp_min(MIN_AP)).to(dtype=dtype, device=device)
 
 
 def compute_cb_weights(counts, beta: float = CB_BETA, device=None, dtype=torch.float32) -> torch.Tensor:
@@ -83,9 +152,12 @@ def compute_cb_weights(counts, beta: float = CB_BETA, device=None, dtype=torch.f
         raise ValueError(f"class counts must all be positive, got {c.tolist()}")
 
     effective_num = 1.0 - torch.pow(torch.tensor(beta, dtype=torch.float64), c)  # 1 - beta^n
-    w = (1.0 - beta) / effective_num                                            # 1 / E_n
-    w = w * (len(c) / w.sum())                                                  # sum(w) == nc
-    return w.to(dtype=dtype, device=device)
+    return _normalise((1.0 - beta) / effective_num).to(dtype=dtype, device=device)
+
+
+def cardd_difficulty_weights(device=None) -> torch.Tensor:
+    """Difficulty weights for CarDD in class-id order (dent .. tire_flat)."""
+    return compute_difficulty_weights(PHASE_A_TEST_AP50.values(), device=device)
 
 
 def cardd_cb_weights(beta: float = CB_BETA, device=None) -> torch.Tensor:
@@ -94,9 +166,16 @@ def cardd_cb_weights(beta: float = CB_BETA, device=None) -> torch.Tensor:
 
 
 def format_weights(weights: torch.Tensor, names) -> str:
-    """`dent=0.65, scratch=0.46, ...` for the proof line."""
+    """`dent=0.65, scratch=0.46, ...` in class-id order, for the proof line."""
     vals = weights.detach().flatten().tolist()
     return ", ".join(f"{n}={v:.4f}" for n, v in zip(names, vals))
+
+
+def rank_weights(weights: torch.Tensor, names) -> str:
+    """`crack 1.3550 > dent 1.1746 > ...` — heaviest first."""
+    vals = weights.detach().flatten().tolist()
+    ordered = sorted(zip(names, vals), key=lambda t: -t[1])
+    return " > ".join(f"{n} {v:.4f}" for n, v in ordered)
 
 
 def bce_multiply_site() -> str | None:
@@ -114,16 +193,17 @@ def bce_multiply_site() -> str | None:
     return None
 
 
-def make_cb_loss_callback(weights: torch.Tensor, class_names, *, strict: bool = True):
-    """`on_train_batch_start` callback: attach CB weights once, then prove it.
+def make_class_weight_callback(weights: torch.Tensor, class_names, *, tag: str, strict: bool = True):
+    """`on_train_batch_start` callback: attach class weights once, then prove it.
 
     The criterion is built lazily on the first forward, so this returns quietly
     on the batches before it exists and applies on the first batch where it
     does. Once applied it becomes a no-op.
 
     Args:
-        weights: (nc,) CB weights in class-id order.
+        weights: (nc,) weights in class-id order.
         class_names: names in class-id order, for the proof line.
+        tag: log prefix identifying the scheme, e.g. "DIFFICULTY WEIGHTS".
         strict: raise if the weights cannot be attached or verified. Leave True
             -- a silent no-op here is precisely the v1 failure being fixed.
     """
@@ -147,7 +227,7 @@ def make_cb_loss_callback(weights: torch.Tensor, class_names, *, strict: bool = 
         site = bce_multiply_site()
         if site is None:
             return fail(
-                "[CB LOSS] ABORT: v8DetectionLoss.get_assigned_targets_and_loss no "
+                f"[{tag}] ABORT: v8DetectionLoss.get_assigned_targets_and_loss no "
                 "longer multiplies bce_loss by self.class_weights. Setting the "
                 "attribute would have no effect on the loss."
             )
@@ -173,29 +253,31 @@ def make_cb_loss_callback(weights: torch.Tensor, class_names, *, strict: bool = 
         attached = getattr(criterion, "class_weights", None)
         if attached is None or not torch.allclose(attached.flatten().cpu(), weights.flatten().cpu()):
             return fail(
-                "[CB LOSS] ABORT: wrote criterion.class_weights but reading it back "
+                f"[{tag}] ABORT: wrote criterion.class_weights but reading it back "
                 f"gave {attached!r}. The weights are NOT on the live loss object."
             )
 
         nc = int(getattr(criterion, "nc", len(class_names)))
         if attached.shape[-1] != nc:
             return fail(
-                f"[CB LOSS] ABORT: attached {attached.shape[-1]} weights but the "
+                f"[{tag}] ABORT: attached {attached.shape[-1]} weights but the "
                 f"criterion has nc={nc}. Broadcasting against bce_loss would fail or "
                 "silently mis-align classes."
             )
 
         state["applied"] = True
         LOGGER.info(
-            f"[CB LOSS] Applied. Weights: {format_weights(attached, class_names)}\n"
-            f"[CB LOSS]   attribute modified : {type(criterion).__name__}.class_weights "
+            f"[{tag}] Applied: {format_weights(attached, class_names)}\n"
+            f"[{tag}]   order above is CLASS-ID order, matching the tensor layout\n"
+            f"[{tag}]   hardest -> easiest : {rank_weights(attached, class_names)}\n"
+            f"[{tag}]   attribute modified : {type(criterion).__name__}.class_weights "
             f"(object id 0x{id(criterion):x}, shape {tuple(attached.shape)}, "
             f"dtype {attached.dtype}, device {attached.device})\n"
-            f"[CB LOSS]   values above were read back FROM the live criterion, not "
+            f"[{tag}]   values above were read back FROM the live criterion, not "
             f"echoed from the value written\n"
-            f"[CB LOSS]   provenance : {via}\n"
-            f"[CB LOSS]   consumed at : {site}\n"
-            f"[CB LOSS]   sum={float(attached.sum()):.6f} (== nc={nc}), "
+            f"[{tag}]   provenance : {via}\n"
+            f"[{tag}]   consumed at : {site}\n"
+            f"[{tag}]   sum={float(attached.sum()):.6f} (== nc={nc}), "
             f"mean={float(attached.mean()):.6f} (== 1.0), "
             f"max/min ratio={float(attached.max() / attached.min()):.3f}"
         )

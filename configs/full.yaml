@@ -33,21 +33,37 @@ box: 7.5
 cls: 0.5
 dfl: 1.5
 
-# --- class-balanced cls loss (Cui et al., CVPR 2019) ----------------------
-# Re-weights the classification BCE by 1 / effective-number-of-samples, using
-# the CarDD train-split counts in CLAUDE.md 0.5. Weights are normalised to sum
-# to nc, so mean weight is 1.0 and the cls-loss magnitude is comparable to an
-# unweighted run.
+# --- cls-term class weighting ---------------------------------------------
+# Exactly ONE of the two schemes below may be true. Both write the same
+# attribute (model.class_weights), so enabling both makes the run
+# unattributable — the trainer raises rather than letting one win silently.
 #
-#   dent=0.3197  scratch=0.2339  crack=0.8380
-#   glass_shatter=1.1386  lamp_broken=1.0958  tire_flat=2.3740
+# DIFFICULTY-AWARE (in use): w_c = 1 / AP_c from Phase A, normalised to sum to
+# nc. Weight goes to what the detector actually gets wrong.
 #
-# Attaches via ultralytics' native `model.class_weights` hook, which
-# v8DetectionLoss multiplies into bce_loss (ultralytics/utils/loss.py:433).
-# An on_train_batch_start callback prints the values read back OFF the live
-# criterion object; v1's version printed "applied" without ever attaching.
-use_cb_loss: true
+#   crack=1.3550  dent=1.1746  scratch=1.1479
+#   lamp_broken=0.8190  tire_flat=0.7861  glass_shatter=0.7174
+#
+# Ratio 1.89x — a much gentler intervention than CB's 10.15x, deliberately so.
+#
+# CAVEAT: those APs are TEST-split numbers, so this run's test mAP is not a
+# clean held-out estimate. Refit PHASE_A_TEST_AP50 from Phase A VALIDATION AP
+# for the publishable version. See docs/DIFFICULTY_WEIGHTS.md.
+difficulty_weights: true
+
+# CLASS-BALANCED (Cui et al., CVPR 2019): w_c = 1/effective-number-of-samples.
+# MEASURED AND REJECTED on CarDD — it weights by frequency, which turned out to
+# be near-uncorrelated with difficulty here: it boosted the already-strong
+# tire_flat (0.898 -> 0.966) and starved the hardest class, crack
+# (0.521 -> 0.399). Kept switchable so the ablation row is reproducible.
+cb_loss: false
 cb_beta: 0.9999
+
+# Whichever scheme is on attaches via ultralytics' native `model.class_weights`
+# hook, which v8DetectionLoss multiplies into bce_loss
+# (ultralytics/utils/loss.py:433). An on_train_batch_start callback prints the
+# values read back OFF the live criterion object; v1's version printed
+# "applied" without ever attaching.
 
 # NOTE: ultralytics' own cls_pw inverse-frequency weighting writes to the same
 # attribute. It defaults to 0.0 (disabled) and must stay there — setting both

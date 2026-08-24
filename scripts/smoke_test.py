@@ -18,9 +18,11 @@ Plus four structural checks:
   * An aux-gradient isolation audit: backward through the aux terms alone must
     reach no backbone/neck parameter (the neck features are detached before
     the aux modules), while the full loss still must.
-  * A class-balanced-loss check: the CB weights are correct, and attaching them
-    demonstrably changes the real cls_loss. v1 logged "applied" for a CB
-    callback that never attached anything, so arithmetic alone is not proof.
+  * A cls class-weight check: the difficulty weights (1/AP from Phase A) are
+    correct, the config selects exactly one scheme, and attaching the weights
+    demonstrably changes the real cls_loss. v1 logged "applied" for a
+    class-weight callback that never attached anything, so arithmetic alone is
+    not proof. The retained CB path is checked too, so it cannot rot.
 
 Run:  python scripts/smoke_test.py
 """
@@ -32,6 +34,7 @@ import traceback
 from pathlib import Path
 
 import torch
+import yaml
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
@@ -39,13 +42,16 @@ sys.path.insert(0, str(REPO))
 import ultralytics  # noqa: E402
 from ultralytics.cfg import get_cfg  # noqa: E402
 
-from xcar.cb_loss import (  # noqa: E402
+from xcar.class_weights import (  # noqa: E402
     CARDD_CLASS_COUNTS,
     CB_BETA,
+    PHASE_A_TEST_AP50,
     bce_multiply_site,
     cardd_cb_weights,
+    cardd_difficulty_weights,
     format_weights,
-    make_cb_loss_callback,
+    make_class_weight_callback,
+    rank_weights,
 )
 from xcar.loss import W_ATTN, W_CONTRAST, W_FRAUD, W_PHYSICS  # noqa: E402
 from xcar.model import PHYSICS_DIM, TOKEN_DIM, XCarDetectionModel, get_neck_channels  # noqa: E402
@@ -420,28 +426,25 @@ def run_detach_audit() -> None:
 
 
 # --------------------------------------------------------------------------
-# class-balanced loss — weights are correct AND actually change the cls term
+# cls class weights — correct arithmetic AND proof they change the cls term
 # --------------------------------------------------------------------------
-def run_cb_loss_check() -> None:
-    """Assert the CB weights are right and that they move the real cls loss.
+class _FakeTrainer:
+    """Stand-in for the ultralytics trainer the callback receives."""
 
-    v1's CB attempt logged success without ever attaching anything, so a check
-    that only inspects our own arithmetic is not enough. This runs the actual
-    criterion twice on one batch — weights off, then on — and requires the
-    logged cls_loss to change.
+    def __init__(self, model):
+        self.model = model
+
+
+def check_weight_vector(weights, names, ranking_key, hardest: str, label: str) -> None:
+    """Shared arithmetic assertions for any weighting scheme.
+
+    Args:
+        ranking_key: per-class quantity the weight should be *decreasing* in
+            (class count for CB, AP for difficulty).
+        hardest: name of the class that must carry the largest weight.
     """
-    print("\n" + "=" * 74)
-    print("PART 4 — CLASS-BALANCED LOSS (weights + proof they reach cls_loss)")
-    print("=" * 74)
-
-    weights = cardd_cb_weights(beta=CB_BETA)
-    nc = len(CARDD_CLASS_COUNTS)
-    counts = list(CARDD_CLASS_COUNTS.values())
-    print(f"\n  beta = {CB_BETA}")
-    print(f"  counts  : {CARDD_CLASS_COUNTS}")
-    print(f"  weights : {format_weights(weights, CARDD_CLASS_COUNTS)}")
-
-    print("\n  weight assertions:")
+    nc = len(names)
+    print(f"\n  {label} weight assertions:")
     check(tuple(weights.shape) == (nc,), f"weights shape {tuple(weights.shape)} == ({nc},)")
     check(
         abs(float(weights.sum()) - nc) < 1e-4,
@@ -449,26 +452,29 @@ def run_cb_loss_check() -> None:
     )
     check(torch.isfinite(weights).all().item(), "weights are all finite")
     check(bool((weights > 0).all()), "weights are all positive")
-    # Rarer class => larger weight. Checked as a strict ordering against counts
-    # rather than a spot value, so a sign flip in the formula cannot slip by.
-    order_counts = sorted(range(nc), key=lambda i: counts[i])
-    ordered_w = [float(weights[i]) for i in order_counts]
+    # Checked as a strict ordering rather than spot values, so a sign flip in
+    # the formula cannot slip past.
+    order = sorted(range(nc), key=lambda i: ranking_key[i])
+    ordered_w = [float(weights[i]) for i in order]
     check(
         all(ordered_w[i] > ordered_w[i + 1] for i in range(nc - 1)),
-        "weight is strictly decreasing in class count (rarest class weighted highest)",
+        f"weight is strictly decreasing in {label} ranking key",
     )
     check(
-        int(weights.argmax()) == counts.index(min(counts)),
-        f"heaviest weight is on the rarest class (tire_flat, n={min(counts)})",
-    )
-    check(
-        bce_multiply_site() is not None,
-        "ultralytics' cls loss still multiplies bce_loss by self.class_weights",
+        names[int(weights.argmax())] == hardest,
+        f"heaviest weight is on {hardest} (got {names[int(weights.argmax())]})",
     )
 
-    # ---- functional: same model, same batch, weights off then on ------
+
+def check_weights_reach_cls_loss(weights, names, tag: str) -> None:
+    """Run the real criterion twice, weights off then on, and require a change.
+
+    v1's attempt logged success without ever attaching anything, so checking our
+    own arithmetic is not enough — only the loss value moving is proof.
+    """
+    nc = len(names)
     torch.manual_seed(0)
-    model = build_model()  # stock detection path; CB touches only the cls term
+    model = build_model()  # stock detection path; this touches only the cls term
     model.train()
     batch = make_batch(seed=5)
     batch["img"] = torch.rand(BATCH, 3, SMALL, SMALL)
@@ -476,53 +482,119 @@ def run_cb_loss_check() -> None:
     _, items_off = model(batch)
     cls_off = float(items_off[1])
 
-    # Drive the real callback against a stand-in trainer, exactly as ultralytics
-    # would at on_train_batch_start.
-    class _FakeTrainer:
-        def __init__(self, m):
-            self.model = m
-
     trainer = _FakeTrainer(model)
-    cb = make_cb_loss_callback(weights, list(CARDD_CLASS_COUNTS))
-    print("\n  invoking the on_train_batch_start callback:")
-    cb(trainer)
+    print(f"\n  invoking the on_train_batch_start callback ({tag}):")
+    make_class_weight_callback(weights, names, tag=tag)(trainer)
 
     attached = getattr(model.criterion, "class_weights", None)
-    check(attached is not None, "callback attached class_weights to the live criterion")
+    check(attached is not None, f"{tag}: callback attached class_weights to the live criterion")
     if attached is not None:
         check(
             tuple(attached.shape) == (1, 1, nc),
-            f"attached shape {tuple(attached.shape)} == (1, 1, {nc}) — broadcasts "
+            f"{tag}: attached shape {tuple(attached.shape)} == (1, 1, {nc}) — broadcasts "
             "over bce_loss (bs, num_anchors, nc)",
         )
         check(
             torch.allclose(attached.flatten().cpu(), weights.cpu()),
-            "attached values equal the computed CB weights",
+            f"{tag}: attached values equal the computed weights",
         )
 
     _, items_on = model(batch)
     cls_on = float(items_on[1])
-    print(f"\n  cls_loss without CB weights : {cls_off:.6f}")
-    print(f"  cls_loss with    CB weights : {cls_on:.6f}")
-    print(f"  delta                       : {cls_on - cls_off:+.6f}")
+    print(f"\n  cls_loss without weights : {cls_off:.6f}")
+    print(f"  cls_loss with    weights : {cls_on:.6f}")
+    print(f"  delta                    : {cls_on - cls_off:+.6f}")
     check(
         cls_off != cls_on,
-        "cls_loss CHANGED once the weights were attached — they are genuinely "
+        f"{tag}: cls_loss CHANGED once the weights were attached — they are genuinely "
         "consumed by the loss, not merely stored on an object",
     )
     check(
         float(items_off[0]) == float(items_on[0]) and float(items_off[2]) == float(items_on[2]),
-        "box_loss and dfl_loss are unchanged — CB touches only the cls term",
+        f"{tag}: box_loss and dfl_loss are unchanged — only the cls term is touched",
     )
 
     # ---- the callback must be a no-op before the criterion exists -----
     torch.manual_seed(0)
     fresh = build_model()
-    cb2 = make_cb_loss_callback(weights, list(CARDD_CLASS_COUNTS))
-    cb2(_FakeTrainer(fresh))
+    make_class_weight_callback(weights, names, tag=tag)(_FakeTrainer(fresh))
     check(
         getattr(fresh, "criterion", None) is None,
-        "callback is a quiet no-op before the criterion is built (it retries next batch)",
+        f"{tag}: callback is a quiet no-op before the criterion is built "
+        "(it retries next batch)",
+    )
+
+
+def run_class_weight_check() -> None:
+    """PART 4 — the active scheme (difficulty), then the retained CB path."""
+    print("\n" + "=" * 74)
+    print("PART 4 — CLS CLASS WEIGHTS (arithmetic + proof they reach cls_loss)")
+    print("=" * 74)
+
+    check(
+        bce_multiply_site() is not None,
+        "ultralytics' cls loss still multiplies bce_loss by self.class_weights",
+    )
+
+    # ---------------- active scheme: difficulty-aware ------------------
+    names = list(PHASE_A_TEST_AP50)
+    ap = list(PHASE_A_TEST_AP50.values())
+    dw = cardd_difficulty_weights()
+    print("\n  --- DIFFICULTY WEIGHTS (active) ---")
+    print(f"  Phase A AP : {PHASE_A_TEST_AP50}")
+    print(f"  weights    : {format_weights(dw, names)}")
+    print(f"  ranked     : {rank_weights(dw, names)}")
+    print(f"  ratio      : {float(dw.max() / dw.min()):.3f}x")
+
+    check_weight_vector(dw, names, ranking_key=ap, hardest="crack", label="difficulty")
+    # The whole point of the change: weight must track difficulty, not frequency.
+    counts = [CARDD_CLASS_COUNTS[n] for n in names]
+    cb = cardd_cb_weights(beta=CB_BETA)
+    check(
+        names[int(dw.argmax())] != names[int(cb.argmax())],
+        f"difficulty and CB disagree on which class needs help most "
+        f"(difficulty={names[int(dw.argmax())]}, CB={names[int(cb.argmax())]}) — "
+        "the reason CB was replaced",
+    )
+    check(
+        float(dw[names.index("crack")]) > float(dw[names.index("tire_flat")]),
+        f"crack ({float(dw[names.index('crack')]):.4f}) outweighs tire_flat "
+        f"({float(dw[names.index('tire_flat')]):.4f}); CB had this backwards "
+        f"({float(cb[names.index('crack')]):.4f} vs {float(cb[names.index('tire_flat')]):.4f})",
+    )
+    check(
+        float(dw.max() / dw.min()) < float(cb.max() / cb.min()),
+        f"difficulty is the gentler intervention ({float(dw.max() / dw.min()):.2f}x "
+        f"vs CB {float(cb.max() / cb.min()):.2f}x)",
+    )
+    check_weights_reach_cls_loss(dw, names, tag="DIFFICULTY WEIGHTS")
+
+    # ---------------- retained scheme: class-balanced ------------------
+    # Still switchable via `cb_loss: true`, so it stays under test rather than
+    # rotting into code that only looks like it works.
+    print("\n  --- CB LOSS (retained, disabled in configs/full.yaml) ---")
+    print(f"  weights    : {format_weights(cb, names)}")
+    check_weight_vector(cb, names, ranking_key=counts, hardest="tire_flat", label="CB")
+
+    # ---------------- the config actually selects one ------------------
+    print("\n  config consistency:")
+    cfg = yaml.safe_load((REPO / "configs" / "full.yaml").read_text())
+    check(
+        cfg.get("difficulty_weights") is True,
+        f"configs/full.yaml has difficulty_weights: true (got {cfg.get('difficulty_weights')!r})",
+    )
+    check(
+        cfg.get("cb_loss") is False,
+        f"configs/full.yaml has cb_loss: false (got {cfg.get('cb_loss')!r})",
+    )
+    check(
+        cfg.get("cls_pw") == 0.0,
+        f"cls_pw stays 0.0 so ultralytics' own weighting cannot overwrite ours "
+        f"(got {cfg.get('cls_pw')!r})",
+    )
+    check(
+        not (cfg.get("difficulty_weights") and cfg.get("cb_loss")),
+        "exactly one weighting scheme is enabled — both write model.class_weights",
     )
 
 
@@ -541,7 +613,7 @@ def main() -> int:
         run_full_gate()
         run_grad_audit()
         run_detach_audit()
-        run_cb_loss_check()
+        run_class_weight_check()
     except Exception:
         traceback.print_exc()
         FAILURES.append(f"uncaught exception: see traceback above")

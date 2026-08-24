@@ -7,12 +7,15 @@ from ultralytics.models.yolo.detect import DetectionTrainer
 from ultralytics.utils import LOGGER, RANK
 from ultralytics.utils.torch_utils import unwrap_model
 
-from xcar.cb_loss import (
+from xcar.class_weights import (
     CARDD_CLASS_COUNTS,
     CB_BETA,
+    PHASE_A_TEST_AP50,
     compute_cb_weights,
+    compute_difficulty_weights,
     format_weights,
-    make_cb_loss_callback,
+    make_class_weight_callback,
+    rank_weights,
 )
 from xcar.model import XCarDetectionModel
 
@@ -25,42 +28,84 @@ class XCarTrainer(DetectionTrainer):
     #: suspicious_thresh.
     xcar_cfg: dict[str, Any] = {}
 
-    #: Class-Balanced loss (Cui et al. 2019) on the detection cls term.
-    use_cb_loss: bool = True
+    #: Difficulty-aware weighting: w_c = 1/AP_c from Phase A. In use.
+    difficulty_weights: bool = True
+    #: Class-Balanced loss (Cui et al. 2019). Measured and rejected on CarDD;
+    #: kept switchable so the ablation row can be reproduced.
+    cb_loss: bool = False
     cb_beta: float = CB_BETA
 
     # ------------------------------------------------------------------
-    # class-balanced loss
+    # cls-term class weighting
     # ------------------------------------------------------------------
     def set_class_weights(self) -> None:
-        """Attach CB weights to the model so the criterion picks them up.
+        """Attach per-class cls weights so the criterion picks them up.
 
         Overrides ultralytics' `cls_pw` inverse-frequency weighting (which is
-        disabled by default, cls_pw=0.0) with the CB formula. Runs inside
-        `_setup_train`, i.e. after the dataloader exists and before the first
-        forward builds the criterion — so `v8DetectionLoss.__init__` reads the
-        weights off the model natively (ultralytics/utils/loss.py:353).
+        disabled by default, cls_pw=0.0). Runs inside `_setup_train`, i.e. after
+        the dataloader exists and before the first forward builds the criterion
+        — so `v8DetectionLoss.__init__` reads the weights off the model natively
+        (ultralytics/utils/loss.py:353).
 
         The `on_train_batch_start` callback registered here then verifies that
         against the LIVE criterion object and prints the proof. Both paths
         exist on purpose: the model attribute is how it should work, the
         callback is how we know it did.
+
+        Exactly one scheme may be active: both write the same attribute, so
+        enabling both would mean whichever ran last silently won.
         """
-        if not self.use_cb_loss:
-            LOGGER.info("[CB LOSS] disabled (use_cb_loss=False); falling back to cls_pw behaviour")
-            return super().set_class_weights()
+        if self.difficulty_weights and self.cb_loss:
+            raise ValueError(
+                "difficulty_weights and cb_loss are both enabled. Both write "
+                "model.class_weights, so one would silently overwrite the other "
+                "and the run would be unattributable. Pick one."
+            )
 
         names = [self.data["names"][i] for i in range(self.data["nc"])]
-        counts = self._cb_class_counts(names)
-        weights = compute_cb_weights(counts, beta=self.cb_beta)
+
+        if self.difficulty_weights:
+            tag = "DIFFICULTY WEIGHTS"
+            ap = self._difficulty_source_ap(names)
+            weights = compute_difficulty_weights(ap)
+            source = f"1/AP from Phase A: {dict(zip(names, ap))}"
+        elif self.cb_loss:
+            tag = "CB LOSS"
+            counts = self._cb_class_counts(names)
+            weights = compute_cb_weights(counts, beta=self.cb_beta)
+            source = f"beta={self.cb_beta}  counts={dict(zip(names, counts))}"
+        else:
+            LOGGER.info(
+                "[CLS WEIGHTS] none enabled (difficulty_weights=False, cb_loss=False); "
+                "falling back to cls_pw behaviour"
+            )
+            return super().set_class_weights()
 
         model = unwrap_model(self.model)
         model.class_weights = weights.to(self.device)
         LOGGER.info(
-            f"[CB LOSS] beta={self.cb_beta}  counts={dict(zip(names, counts))}\n"
-            f"[CB LOSS] weights set on model.class_weights: {format_weights(weights, names)}"
+            f"[{tag}] source: {source}\n"
+            f"[{tag}] set on model.class_weights: {format_weights(weights, names)}\n"
+            f"[{tag}] hardest -> easiest: {rank_weights(weights, names)}"
         )
-        self.add_callback("on_train_batch_start", make_cb_loss_callback(weights, names))
+        self.add_callback("on_train_batch_start", make_class_weight_callback(weights, names, tag=tag))
+
+    def _difficulty_source_ap(self, names: list[str]) -> list[float]:
+        """Phase A per-class AP in class-id order, for the inverse-AP weights.
+
+        Refuses to guess for a class it has no measurement for: a missing entry
+        would otherwise silently become an arbitrary weight, which is exactly
+        the kind of unattributable change CLAUDE.md 1.3 forbids.
+        """
+        missing = [n for n in names if n not in PHASE_A_TEST_AP50]
+        if missing:
+            raise RuntimeError(
+                f"[DIFFICULTY WEIGHTS] no Phase A AP recorded for {missing}. "
+                "Add the measured values to PHASE_A_TEST_AP50 in "
+                "xcar/class_weights.py, or disable difficulty_weights. "
+                "Refusing to invent a weight."
+            )
+        return [PHASE_A_TEST_AP50[n] for n in names]
 
     def _cb_class_counts(self, names: list[str]) -> list[int]:
         """Per-class instance counts for the CB formula, in class-id order.

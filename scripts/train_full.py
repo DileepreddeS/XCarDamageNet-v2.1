@@ -33,7 +33,15 @@ sys.path.insert(0, str(REPO))
 import ultralytics  # noqa: E402
 from ultralytics import YOLO  # noqa: E402
 
-from xcar.cb_loss import CARDD_CLASS_COUNTS, CB_BETA, compute_cb_weights, format_weights  # noqa: E402
+from xcar.class_weights import (  # noqa: E402
+    CARDD_CLASS_COUNTS,
+    CB_BETA,
+    PHASE_A_TEST_AP50,
+    compute_cb_weights,
+    compute_difficulty_weights,
+    format_weights,
+    rank_weights,
+)
 from xcar.loss import W_ATTN, W_CONTRAST, W_FRAUD, W_PHYSICS  # noqa: E402
 from xcar.trainer import XCarTrainer  # noqa: E402
 
@@ -45,7 +53,7 @@ NON_TRAIN_KEYS = {
     "phase", "description", "model",
     "use_attention", "use_physics", "use_contrastive",
     "attach", "token_stride", "suspicious_thresh",
-    "use_cb_loss", "cb_beta",
+    "difficulty_weights", "cb_loss", "cb_beta",
     "backup_dir", "backup_every",
 }
 
@@ -256,8 +264,14 @@ def main() -> int:
         "suspicious_thresh": cfg["suspicious_thresh"],
     }
     XCarTrainer.xcar_cfg = aux_cfg
-    XCarTrainer.use_cb_loss = bool(cfg.get("use_cb_loss", True))
+    XCarTrainer.difficulty_weights = bool(cfg.get("difficulty_weights", True))
+    XCarTrainer.cb_loss = bool(cfg.get("cb_loss", False))
     XCarTrainer.cb_beta = float(cfg.get("cb_beta", CB_BETA))
+    if XCarTrainer.difficulty_weights and XCarTrainer.cb_loss:
+        print("\nERROR: difficulty_weights and cb_loss are both true in the config. "
+              "Both write model.class_weights; one would silently overwrite the "
+              "other. Enable exactly one.")
+        return 2
 
     train_kwargs = {k: v for k, v in cfg.items() if k not in NON_TRAIN_KEYS}
     if args.data:
@@ -272,14 +286,23 @@ def main() -> int:
           f"physics={W_PHYSICS}  fraud={W_FRAUD}")
     print("aux grads   : DETACHED at the neck — aux losses train the aux "
           "modules only, never the backbone/neck")
-    if XCarTrainer.use_cb_loss:
+    if XCarTrainer.difficulty_weights:
+        preview = compute_difficulty_weights(PHASE_A_TEST_AP50.values())
+        print(f"cls weights : DIFFICULTY (1/AP from Phase A)  "
+              f"-> {format_weights(preview, PHASE_A_TEST_AP50)}")
+        print(f"              hardest -> easiest: {rank_weights(preview, PHASE_A_TEST_AP50)}")
+        print("              source APs are TEST-split, so this run's test mAP is "
+              "not a clean held-out estimate")
+        print("              (the trainer prints [DIFFICULTY WEIGHTS] proof read off "
+              "the live criterion at batch 1)")
+    elif XCarTrainer.cb_loss:
         preview = compute_cb_weights(CARDD_CLASS_COUNTS.values(), beta=XCarTrainer.cb_beta)
-        print(f"cb loss     : ON  beta={XCarTrainer.cb_beta}  "
-              f"expected weights -> {format_weights(preview, CARDD_CLASS_COUNTS)}")
-        print("              (the trainer prints [CB LOSS] proof read off the live "
-              "criterion at batch 1)")
+        print(f"cls weights : CB LOSS  beta={XCarTrainer.cb_beta}  "
+              f"-> {format_weights(preview, CARDD_CLASS_COUNTS)}")
+        print("              (measured and rejected on CarDD — see "
+              "docs/DIFFICULTY_WEIGHTS.md)")
     else:
-        print("cb loss     : OFF")
+        print("cls weights : NONE (unweighted cls loss)")
     print("\ntrain kwargs:")
     for k in sorted(train_kwargs):
         print(f"  {k:<16} {train_kwargs[k]}")
@@ -315,8 +338,28 @@ def main() -> int:
 
     print_comparison(baseline, full)
 
+    if XCarTrainer.difficulty_weights:
+        cls_weight_cfg = {
+            "scheme": "difficulty",
+            "source_ap": dict(PHASE_A_TEST_AP50),
+            "source_split": "test",
+            "weights": dict(zip(
+                PHASE_A_TEST_AP50,
+                [round(float(v), 6) for v in compute_difficulty_weights(PHASE_A_TEST_AP50.values())],
+            )),
+            "caveat": "weights derived from TEST-split AP; this test mAP is not a "
+                      "clean held-out estimate",
+        }
+    elif XCarTrainer.cb_loss:
+        cls_weight_cfg = {"scheme": "cb", "beta": XCarTrainer.cb_beta,
+                          "counts": dict(CARDD_CLASS_COUNTS)}
+    else:
+        cls_weight_cfg = {"scheme": "none"}
+
     summary = {"phase": cfg["phase"], "full": full, "phase_a_baseline": baseline,
                "aux_cfg": aux_cfg,
+               "cls_class_weights": cls_weight_cfg,
+               "aux_gradients": "detached at neck and at the L_physics target",
                "loss_weights": {"attn": W_ATTN, "contrast": W_CONTRAST,
                                 "physics": W_PHYSICS, "fraud": W_FRAUD}}
     out = save_dir / "full_test_metrics.json"
