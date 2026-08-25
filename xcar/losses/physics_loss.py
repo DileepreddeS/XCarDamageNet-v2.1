@@ -8,7 +8,7 @@ import torch.nn.functional as F
 class PhysicsConsistencyLoss(nn.Module):
     """Cross-entropy between physics-implied class and predicted class.
 
-    Uses the FraudHead's `implied_logits` output as the physics prediction.
+    Uses the ImpliedClassHead's `implied_logits` output as the physics prediction.
     Backpropagates through both the physics head and the detector.
     """
 
@@ -29,7 +29,7 @@ class PhysicsConsistencyLoss(nn.Module):
         """Compute physics consistency loss.
 
         Args:
-            physics_implied_logits: (B, num_classes) — logits from FraudHead
+            physics_implied_logits: (B, num_classes) — logits from ImpliedClassHead
                 representing what the physics tokens imply the damage class should be
             predicted_class_logits: (B, num_classes) — detection head class logits
 

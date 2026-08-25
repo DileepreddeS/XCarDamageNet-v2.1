@@ -4,8 +4,7 @@ Enables, on top of the stock YOLO11m detection path:
 
     AttentionMapHead                                 -> L_attn      (0.10)
     FeatureTokenAdapter + PhysicsTokenEncoder
-        + FraudHead                                  -> L_physics   (0.02)
-                                                     -> L_fraud     (0.01)
+        + ImpliedClassHead                           -> L_physics   (0.02)
     ContrastiveDamageModule                          -> L_contrast  (0.05)
 
 Warm-starts from a Phase A checkpoint: the backbone, neck and detect head
@@ -42,7 +41,7 @@ from xcar.class_weights import (  # noqa: E402
     format_weights,
     rank_weights,
 )
-from xcar.loss import W_ATTN, W_CONTRAST, W_FRAUD, W_PHYSICS  # noqa: E402
+from xcar.loss import W_ATTN, W_CONTRAST, W_PHYSICS  # noqa: E402
 from xcar.trainer import XCarTrainer  # noqa: E402
 
 EXPECTED_ULTRALYTICS = "8.4.48"
@@ -59,7 +58,7 @@ NON_TRAIN_KEYS = {
 
 EXPECTED_LOSS_NAMES = (
     "box_loss", "cls_loss", "dfl_loss",
-    "attn_loss", "cont_loss", "phys_loss", "fraud_loss",
+    "attn_loss", "cont_loss", "phys_loss",
 )
 
 
@@ -67,7 +66,7 @@ EXPECTED_LOSS_NAMES = (
 # callbacks
 # --------------------------------------------------------------------------
 def make_loss_name_check():
-    """Fail fast if the 7 loss columns are not wired up before epoch 1."""
+    """Fail fast if the 6 loss columns are not wired up before epoch 1."""
 
     def cb(trainer):
         names = tuple(trainer.loss_names)
@@ -283,7 +282,7 @@ def main() -> int:
     print(f"\nwarm start  : {weights}")
     print(f"aux modules : {aux_cfg}")
     print(f"loss weights: attn={W_ATTN}  contrast={W_CONTRAST}  "
-          f"physics={W_PHYSICS}  fraud={W_FRAUD}")
+          f"physics={W_PHYSICS}")
     print("aux grads   : DETACHED at the neck — aux losses train the aux "
           "modules only, never the backbone/neck")
     if XCarTrainer.difficulty_weights:
@@ -361,7 +360,7 @@ def main() -> int:
                "cls_class_weights": cls_weight_cfg,
                "aux_gradients": "detached at neck and at the L_physics target",
                "loss_weights": {"attn": W_ATTN, "contrast": W_CONTRAST,
-                                "physics": W_PHYSICS, "fraud": W_FRAUD}}
+                                "physics": W_PHYSICS}}
     out = save_dir / "full_test_metrics.json"
     out.write_text(json.dumps(summary, indent=2) + "\n")
     print(f"\nwrote {out}")

@@ -11,7 +11,7 @@ from ultralytics.utils import LOGGER
 from xcar.modules.adapter import FeatureTokenAdapter
 from xcar.modules.attention_head import AttentionMapHead
 from xcar.modules.contrastive import ContrastiveDamageModule
-from xcar.modules.fraud_head import FraudHead
+from xcar.modules.implied_class_head import ImpliedClassHead
 from xcar.modules.physics_encoder import PhysicsTokenEncoder
 
 TOKEN_DIM = 384      # PhysicsTokenEncoder input dim
@@ -99,8 +99,8 @@ class XCarDetectionModel(DetectionModel):
         """
         Args:
             use_attention:  enable AttentionMapHead (+ L_attn).
-            use_physics:    enable adapter + PhysicsTokenEncoder + FraudHead
-                            (+ L_physics, + L_fraud).
+            use_physics:    enable adapter + PhysicsTokenEncoder +
+                            ImpliedClassHead (+ L_physics).
             use_contrastive: enable ContrastiveDamageModule (+ L_contrast).
             attach: "p3" (default, 128x128 = 16,384 tokens @1024px) or "p4"
                 (64x64 = 4,096 tokens), which trades token resolution for
@@ -151,7 +151,7 @@ class XCarDetectionModel(DetectionModel):
         if self.use_physics:
             aux["adapter"] = FeatureTokenAdapter(in_ch=self.token_src_ch, token_dim=TOKEN_DIM)
             aux["physics"] = PhysicsTokenEncoder(in_dim=TOKEN_DIM)
-            aux["fraud_head"] = FraudHead(physics_dim=PHYSICS_DIM)
+            aux["implied_head"] = ImpliedClassHead(physics_dim=PHYSICS_DIM)
         if self.use_contrastive:
             aux["contrastive"] = ContrastiveDamageModule(token_dim=PHYSICS_DIM, use_projection=True)
         self.aux = nn.ModuleDict(aux)
@@ -260,14 +260,13 @@ class XCarDetectionModel(DetectionModel):
 
         tokens384 = self.aux["adapter"](src)                        # (B, N, 384)
         tokens396, physics_dict = self.aux["physics"](tokens384)    # (B, N, 396)
-        fraud_score, fraud_implied = self.aux["fraud_head"](tokens396)
+        implied_logits = self.aux["implied_head"](tokens396)
 
         aux.update(
             token_hw=(th, tw),
             tokens_physics=tokens396,
             physics_dict=physics_dict,
-            fraud_score=fraud_score,
-            fraud_implied=fraud_implied,
+            implied_logits=implied_logits,
         )
 
         # --- contrastive --------------------------------------------------
@@ -333,7 +332,7 @@ class XCarDetectionModel(DetectionModel):
         if self.use_contrastive:
             names.append("cont_loss")
         if self.use_physics:
-            names.extend(["phys_loss", "fraud_loss"])
+            names.append("phys_loss")
         return tuple(names)
 
     def config_summary(self) -> dict[str, Any]:

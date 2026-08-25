@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from ultralytics.utils.loss import v8DetectionLoss
 from ultralytics.utils.ops import xywh2xyxy
 
@@ -14,7 +13,6 @@ from xcar.losses.physics_loss import PhysicsConsistencyLoss
 W_ATTN = 0.10
 W_CONTRAST = 0.05
 W_PHYSICS = 0.02
-W_FRAUD = 0.01  # weakest aux weight — a prior on clean data, not supervision
 
 MAX_MINING_TOKENS = 2048  # cap candidates before Python-loop triplet mining
 N_TRIPLETS = 64
@@ -38,7 +36,6 @@ class XCarLoss(v8DetectionLoss):
         self.w_attn = W_ATTN
         self.w_contrast = W_CONTRAST
         self.w_physics = W_PHYSICS
-        self.w_fraud = W_FRAUD
 
         # Diagnostics filled per call — read by scripts/smoke_test.py and
         # logged each epoch by XCarTrainer.
@@ -82,7 +79,6 @@ class XCarLoss(v8DetectionLoss):
 
         if self.use_physics:
             terms.append(("phys_loss", self.w_physics, self._physics_term(aux, parsed, stats)))
-            terms.append(("fraud_loss", self.w_fraud, self._fraud_term(aux)))
 
         for name, _, value in terms:
             stats[name] = float(value.detach())
@@ -170,9 +166,9 @@ class XCarLoss(v8DetectionLoss):
         Entropy near 0 with agreement pinned at 1.00 and phys_loss near 0 is the
         collapse signature; the detector's own mAP is now unaffected either way.
         """
-        implied = aux.get("fraud_implied")
+        implied = aux.get("implied_logits")
         if implied is None:
-            raise RuntimeError("use_physics is set but _aux has no 'fraud_implied'.")
+            raise RuntimeError("use_physics is set but _aux has no 'implied_logits'.")
         pred_class_logits = parsed["scores"].detach().amax(dim=2)  # (B, nc), no grad to detector
 
         with torch.no_grad():
@@ -183,28 +179,6 @@ class XCarLoss(v8DetectionLoss):
             stats["phys_agree"] = float(agree)
 
         return self.physics_loss(implied, pred_class_logits)
-
-    def _fraud_term(self, aux: dict) -> torch.Tensor:
-        """L_fraud — weak prior that training images are not fraudulent.
-
-        The dataset carries no fraud labels, so every training image is assumed
-        clean and `fraud_score` is pushed toward 0 by a one-sided BCE. Two
-        limits on what this buys:
-
-          * It gives FraudHead a gradient path. That is its main purpose.
-          * With no positive examples it cannot teach discrimination — a head
-            that outputs 0 for every input satisfies it perfectly. Any fraud
-            AUC number must come from held-out data with real positives, not
-            from this term converging.
-
-        `fraud_score` is already sigmoid-activated in FraudHead, so BCE (not
-        BCEWithLogits) is correct here. PyTorch clamps the log at -100, so a
-        saturated score cannot produce inf/NaN.
-        """
-        fraud_score = aux.get("fraud_score")
-        if fraud_score is None:
-            raise RuntimeError("use_physics is set but _aux has no 'fraud_score'.")
-        return F.binary_cross_entropy(fraud_score, torch.zeros_like(fraud_score))
 
     # ------------------------------------------------------------------
     # target construction

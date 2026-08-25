@@ -4,7 +4,7 @@
 # are the three aux module flags and the checkpoint this initialises from.
 
 phase: full
-description: attention + physics + fraud + contrastive, all enabled
+description: attention + physics + contrastive, all enabled
 
 model: /home/ds3424/XCarDamageNet-v2.1/models/phase_a_best.pt
 data: /scratch/ds3424/cardd/yolo/cardd.yaml
@@ -86,7 +86,7 @@ hsv_v: 0.4
 
 # --- aux modules ----------------------------------------------------------
 use_attention: true        # AttentionMapHead        -> L_attn     (0.10)
-use_physics: true          # adapter + physics + fraud -> L_physics (0.02), L_fraud (0.01)
+use_physics: true          # adapter + physics + implied-class head -> L_physics (0.02)
 use_contrastive: true      # ContrastiveDamageModule -> L_contrast (0.05)
 
 # Token attach point for physics/contrastive. The attention head is always on

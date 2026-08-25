@@ -53,7 +53,7 @@ from xcar.class_weights import (  # noqa: E402
     make_class_weight_callback,
     rank_weights,
 )
-from xcar.loss import W_ATTN, W_CONTRAST, W_FRAUD, W_PHYSICS  # noqa: E402
+from xcar.loss import W_ATTN, W_CONTRAST, W_PHYSICS  # noqa: E402
 from xcar.model import PHYSICS_DIM, TOKEN_DIM, XCarDetectionModel, get_neck_channels  # noqa: E402
 
 IMGSZ = 1024
@@ -178,7 +178,7 @@ def run_full_gate() -> None:
         # ---- assert every aux output shape, print all shapes ----
         print("\n  aux output shapes:")
         for key in ("attn_maps", "tokens_physics", "tokens_contrastive", "damage_scores",
-                    "fraud_score", "fraud_implied", "suspicious_mask"):
+                    "implied_logits", "suspicious_mask"):
             if key in aux:
                 print(f"    {key:<20} {tuple(aux[key].shape)}")
         for key, val in aux["physics_dict"].items():
@@ -190,8 +190,7 @@ def run_full_gate() -> None:
         check_shape(aux["tokens_physics"], (BATCH, expected_n, PHYSICS_DIM), "tokens_physics")
         check_shape(aux["tokens_contrastive"], (BATCH, expected_n, PHYSICS_DIM), "tokens_contrastive")
         check_shape(aux["damage_scores"], (BATCH, expected_n), "damage_scores")
-        check_shape(aux["fraud_score"], (BATCH, 1), "fraud_score")
-        check_shape(aux["fraud_implied"], (BATCH, NUM_CLASSES), "fraud_implied")
+        check_shape(aux["implied_logits"], (BATCH, NUM_CLASSES), "implied_logits")
         check_shape(aux["suspicious_mask"], (BATCH, expected_n), "suspicious_mask")
         check_shape(aux["physics_dict"]["normal"], (BATCH, expected_n, 3), "physics.normal")
         check_shape(aux["physics_dict"]["material"], (BATCH, expected_n, 6), "physics.material")
@@ -210,7 +209,7 @@ def run_full_gate() -> None:
         # ---- every loss term finite AND non-zero where it should be ----
         names = ("box_loss", "cls_loss", "dfl_loss") + model.aux_loss_names
         print(f"\n  loss terms ({len(names)} logged, weights: attn={W_ATTN} "
-              f"contrast={W_CONTRAST} physics={W_PHYSICS} fraud={W_FRAUD}):")
+              f"contrast={W_CONTRAST} physics={W_PHYSICS}):")
         check(
             len(loss_items) == len(names),
             f"loss_items length {len(loss_items)} == len(loss_names) {len(names)}",
@@ -252,7 +251,7 @@ def run_full_gate() -> None:
 # --------------------------------------------------------------------------
 # gradient audit per configuration — the anti-"dead module" check
 # --------------------------------------------------------------------------
-AUX_GROUPS = ("attn_head", "adapter", "physics", "fraud_head", "contrastive")
+AUX_GROUPS = ("attn_head", "adapter", "physics", "implied_head", "contrastive")
 
 
 def grad_report(model) -> dict[str, str]:
@@ -286,11 +285,11 @@ def run_grad_audit() -> None:
         "B  attention": (dict(use_attention=True), ["attn_head"]),
         "C  + physics": (
             dict(use_attention=True, use_physics=True),
-            ["attn_head", "adapter", "physics", "fraud_head"],
+            ["attn_head", "adapter", "physics", "implied_head"],
         ),
         "D  + contrastive": (
             dict(use_attention=True, use_physics=True, use_contrastive=True),
-            ["attn_head", "adapter", "physics", "fraud_head", "contrastive"],
+            ["attn_head", "adapter", "physics", "implied_head", "contrastive"],
         ),
     }
     small = 256  # reduced imgsz — topology only
